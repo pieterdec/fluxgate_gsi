@@ -1,0 +1,592 @@
+<!--
+SPDX-FileCopyrightText: Copyright (C) 2025 ARDUINO SA <http://www.arduino.cc>
+SPDX-License-Identifier: MPL-2.0
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Magnetic field measurement</title>
+    <link rel="stylesheet" type="text/css" href="style.css">
+
+    <!-- Chart.js core -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+    <!-- Time scale support (needed for zoom/pan on real timestamps) -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <!-- Hammer.js: chartjs-plugin-zoom needs this for drag-to-pan / pinch gestures -->
+    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8/hammer.min.js"></script>
+    <!-- Zoom / pan (mouse wheel, pinch, drag-to-pan) -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+    <!-- Mean/median horizontal reference lines -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+
+    <script src="libs/socket.io.min.js"></script>
+    <script src="app.js"></script>
+
+    <style>
+        /* --- Additions to make the charts fill the page and add zoom/stats/recording UI ---
+             These extend the existing style.css rather than replace it. */
+
+        /* style.css caps .app-container at 1300px and .container at a fixed
+           550px (620px inside .top-row). Our chart is now much wider than
+           that, so it was spilling past those boxes' edges - the part still
+           inside the old boundaries showed the card's #ECF1F1 background,
+           the part outside showed the page's #DAE3E3 background instead,
+           which is exactly the two-tone vertical band you were seeing. */
+        html, body {
+            height: 100%;
+        }
+
+        .app-container {
+            max-width: 92vw !important;
+            width: 92vw !important;
+            margin: 0 auto;
+        }
+
+        .container,
+        .top-row .container {
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            /* NOTE: the original style.css also hard-codes a fixed
+               height: 550px on .container (matching its old fixed-width
+               card design). We only used to override the *width* related
+               properties above, so the height stayed capped at 550px no
+               matter how tall the browser window was - that's why only
+               "half the screen" was ever used. Overriding height here
+               fixes it. */
+            height: 100% !important;
+            max-height: none !important;
+            min-height: 0;
+        }
+
+        .main-content, .tab-content, .top-row {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .tab-content.active {
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 140px);
+            min-height: 420px;
+        }
+
+        .top-row {
+            flex: 1;
+            display: flex;
+            align-items: stretch; /* style.css sets flex-start here, which stopped .container from stretching to fill the available height */
+            min-height: 0;
+            /* same fixed-height issue as .container above can also exist
+               on .top-row in the original stylesheet - neutralize it. */
+            height: auto !important;
+            max-height: none !important;
+        }
+
+        .chart-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin: 4px 0 8px;
+            flex-wrap: wrap;
+        }
+
+        .chart-toolbar button {
+            padding: 6px 14px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            background: #fff;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+
+        .chart-toolbar button:hover {
+            background: #f0f0f0;
+        }
+
+        .chart-toolbar label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.9rem;
+            cursor: pointer;
+        }
+
+        .chart-toolbar .hint {
+            font-size: 0.8rem;
+            color: #888;
+            margin-left: auto;
+        }
+
+        /* Recording controls */
+        .record-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+
+        .record-toolbar button {
+            padding: 6px 14px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            background: #fff;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+
+        .record-toolbar button:hover { background: #f0f0f0; }
+
+        #rec-start { border-color: #2b8a3e; color: #2b8a3e; }
+        #rec-stop { border-color: #c92a2a; color: #c92a2a; }
+        #rec-save { border-color: #1864ab; color: #1864ab; }
+        #rec-clear { border-color: #999; color: #555; }
+
+        .rec-status {
+            font-size: 0.85rem;
+            color: #444;
+            padding: 4px 10px;
+            border-radius: 6px;
+            background: #fff;
+            border: 1px solid #e5e5e5;
+        }
+
+        .rec-status.is-recording {
+            color: #c92a2a;
+            font-weight: 600;
+        }
+
+        .gain-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+            font-size: 0.85rem;
+        }
+
+        .gain-toolbar select {
+            padding: 5px 8px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            font-size: 0.85rem;
+        }
+
+        .gain-toolbar button {
+            padding: 5px 14px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            background: #fff;
+            cursor: pointer;
+            font-size: 0.85rem;
+        }
+
+        .gain-toolbar button:hover { background: #f0f0f0; }
+
+        #gain-auto-toggle.active {
+            border-color: #7048e8;
+            color: #7048e8;
+            font-weight: 600;
+            background: #f5f2ff;
+        }
+
+        .gain-status {
+            color: #888;
+            font-size: 0.8rem;
+        }
+
+        .sample-rate-control {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.85rem;
+            margin-left: auto;
+        }
+
+        .sample-rate-control input {
+            width: 80px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+        }
+
+        .sample-rate-control button {
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            background: #fff;
+            cursor: pointer;
+        }
+
+        .window-control {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.85rem;
+        }
+
+        .window-control input {
+            width: 90px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+        }
+
+        .window-control button {
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            background: #fff;
+            cursor: pointer;
+        }
+
+        /* Replaces the old tab strip now that only "Live" remains - a
+           simple status pill instead of a set of tab buttons. */
+        .live-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            width: fit-content;
+            padding: 5px 16px;
+            margin-bottom: 1em;
+            border-radius: 8px;
+            background: #FFF;
+            border: 1px solid #C9D2D2;
+            color: #008184;
+            font-family: "Open Sans", serif;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .chart-body {
+            flex: 1;
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            min-height: 0;
+        }
+
+        .chart-canvas-wrap {
+            position: relative;
+            flex: 0 0 70vw;
+            width: 70vw;
+            max-width: 70vw;
+            min-width: 0;
+        }
+
+        .chart-canvas-wrap canvas {
+            cursor: grab;
+        }
+
+        .chart-canvas-wrap canvas:active {
+            cursor: grabbing;
+        }
+
+        /* Right-hand column: stats box + saved-files box, stacked */
+        .side-panel {
+            width: 180px;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            min-height: 0;
+        }
+
+        .stats-panel {
+            width: 100%;
+            box-sizing: border-box;
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            padding: 12px;
+            border: 1px solid #e5e5e5;
+            border-radius: 8px;
+            background: #fafafa;
+        }
+
+        .stat-row {
+            font-size: 0.85rem;
+            color: #555;
+            line-height: 1.5;
+        }
+
+        .stat-row b {
+            font-size: 1.05rem;
+            color: #222;
+        }
+
+        .stat-pair {
+            display: flex;
+            gap: 8px;
+        }
+
+        .stat-cell {
+            flex: 1;
+            min-width: 0;
+            font-size: 0.78rem;
+            color: #555;
+            line-height: 1.4;
+        }
+
+        .stat-cell b {
+            font-size: 0.92rem;
+            color: #222;
+        }
+
+        .stat-swatch {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+
+        .stat-swatch.mean { background: #2b8a3e; }
+        .stat-swatch.median { background: #1864ab; }
+        .stat-swatch.std { background: #7048e8; }
+        .stat-swatch.mad { background: #0ca678; }
+
+        .stat-count {
+            margin-top: auto;
+            color: #999;
+            font-size: 0.75rem;
+        }
+
+        /* Saved-files interactive menu */
+        .saved-files-panel {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 12px;
+            border: 1px solid #e5e5e5;
+            border-radius: 8px;
+            background: #fafafa;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-height: 0;
+            overflow: hidden;
+        }
+
+        .saved-files-title {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #444;
+            margin-bottom: 2px;
+        }
+
+        .saved-files-list {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            overflow-y: auto;
+        }
+
+        .saved-files-list a {
+            display: block;
+            padding: 5px 6px;
+            border-radius: 5px;
+            font-size: 0.78rem;
+            color: #1864ab;
+            text-decoration: none;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .saved-files-list a:hover {
+            background: #eef3f7;
+            text-decoration: underline;
+        }
+
+        .saved-files-empty {
+            font-size: 0.78rem;
+            color: #999;
+            padding: 5px 6px;
+        }
+
+        .saved-files-viewall {
+            margin-top: 4px;
+            font-size: 0.78rem;
+            color: #555 !important;
+            font-weight: 600;
+            text-decoration: none;
+        }
+
+        .saved-files-viewall:hover {
+            text-decoration: underline;
+        }
+
+        /* "Start recording" name-prompt modal */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.35);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .modal-overlay.open {
+            display: flex;
+        }
+
+        .modal-box {
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px 22px;
+            width: 320px;
+            max-width: 90vw;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+        }
+
+        .modal-box h3 {
+            margin: 0 0 12px;
+            font-size: 1.05rem;
+            color: #222;
+        }
+
+        .modal-box label {
+            display: block;
+            font-size: 0.85rem;
+            color: #555;
+            margin-bottom: 6px;
+        }
+
+        .modal-box input[type="text"] {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            font-size: 0.95rem;
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+            margin-top: 18px;
+        }
+
+        .modal-actions button {
+            padding: 7px 16px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            background: #fff;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+
+        .modal-actions button:hover {
+            background: #f0f0f0;
+        }
+
+        #start-name-confirm {
+            border-color: #2b8a3e;
+            color: #2b8a3e;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+<div class="app-container">
+    <div class="header">
+        <h1 class="arduino-text">Magnetic field measurement</h1>
+        <img class="arduino-logo" src="./img/RGB-Arduino-Logo_Color Inline Loop.svg" alt="Arduino Logo">
+    </div>
+    <div class="live-badge">
+        <span id="live-circle"></span>
+        Live
+    </div>
+    <div class="main-content">
+
+        <div id="live" class="tab-content active">
+            <div class="top-row">
+                <div class="container">
+                    <div class="graph-header">
+                        <span>Magnetic field (µT)</span>
+                        <img src="./img/info.svg" alt="Info" class="info-btn temp"/>
+                        <div class="popover"></div>
+                    </div>
+                    <div class="record-toolbar">
+                        <button id="rec-start">Start</button>
+                        <button id="rec-save">Save</button>
+                        <button id="rec-stop">Stop</button>
+                        <button id="rec-clear">Clear</button>
+                        <span id="rec-status" class="rec-status">Stopped</span>
+                        <div class="sample-rate-control">
+                            <label for="sample-rate-input">Sample every</label>
+                            <input type="number" id="sample-rate-input" min="50" step="50" placeholder="ms">
+                            <span>ms</span>
+                            <button id="sample-rate-set">Set</button>
+                        </div>
+                    </div>
+                    <div class="gain-toolbar">
+                        <label for="gain-input">Gain</label>
+                        <select id="gain-input">
+                            <option value="0">0 · ±6.144 V · 187.5 µV/LSB</option>
+                            <option value="1">1 · ±4.096 V · 125 µV/LSB</option>
+                            <option value="2">2 · ±2.048 V · 62.5 µV/LSB</option>
+                            <option value="4">4 · ±1.024 V · 31.25 µV/LSB</option>
+                            <option value="8">8 · ±0.512 V · 15.6 µV/LSB</option>
+                            <option value="16">16 · ±0.256 V · 7.8 µV/LSB</option>
+                        </select>
+                        <button id="gain-set">Set</button>
+                        <button id="gain-auto-toggle">Auto: Off</button>
+                        <span id="gain-status" class="gain-status"></span>
+                    </div>
+                    <div class="chart-toolbar">
+                        <button id="magnetic-live-chart-reset-zoom">Reset zoom</button>
+                        <label><input type="checkbox" id="magnetic-live-chart-stats-toggle"> Show mean / median</label>
+                        <label><input type="checkbox" id="magnetic-live-chart-spread-toggle"> Show std / MAD</label>
+                        <div class="window-control">
+                            <label for="window-seconds-input">Show last</label>
+                            <input type="number" id="window-seconds-input" min="1" step="1" value="3600">
+                            <span>s</span>
+                            <button id="window-seconds-set">Set</button>
+                        </div>
+                        <span class="hint">Scroll or pinch to zoom · drag to pan</span>
+                    </div>
+                    <div class="chart-body">
+                        <div class="chart-canvas-wrap">
+                            <canvas id="magnetic-live-chart"></canvas>
+                            <div id="magnetic-live-chart-nodata" class="nodata-container">
+                                <img src="./img/nodata.svg" class="nodata-img">
+                                <span class="no-data">No data</span>
+                            </div>
+                        </div>
+                        <div class="side-panel">
+                            <div class="stats-panel" id="magnetic-live-chart-stats"></div>
+                            <div class="saved-files-panel" id="magnetic-live-chart-savedfiles">
+                                <div class="saved-files-title">Saved files</div>
+                                <div class="saved-files-list"></div>
+                                <a class="saved-files-viewall" href="/files" target="_blank">View all saved files &rarr;</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+    <div id="error-container" class="error-message" style="display: none;"></div>
+</div>
+
+<!-- Name prompt shown when "Start" is pressed -->
+<div class="modal-overlay" id="start-name-modal">
+    <div class="modal-box">
+        <h3>Start recording</h3>
+        <label for="start-name-input">File name</label>
+        <input type="text" id="start-name-input" autocomplete="off">
+        <div class="modal-actions">
+            <button id="start-name-cancel">Cancel</button>
+            <button id="start-name-confirm">Start</button>
+        </div>
+    </div>
+</div>
+</body>
+</html>
