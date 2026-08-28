@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -52,8 +53,10 @@ SESSIONS_META = os.path.join(DATA_DIR, "sessions.json")  # {filename: {"saved": 
 RETENTION_DAYS = 7
 
 _state_lock = threading.Lock()
-_recording = False    # True between Start and Stop
+_recording = False    # True whenever something is actively being written (which is now almost always)
 _current_file = None  # full path of the active session CSV, or None
+_current_is_generic = False  # True = auto-named yyyy_mm_dd_hh_mm_ss.sss file; False = a named (Start) recording
+DEFAULT_BASENAME_FALLBACK = "recording"  # only used if Start is somehow called with an empty name
 
 # Marks "where the live view starts". A page refresh re-queries everything
 # from this point forward (see on_live_history below), so the live chart
@@ -112,11 +115,7 @@ def _unique_filename(base_name):
         n += 1
 
 
-def _new_session_file(base_name=None):
-    if base_name:
-        name = _unique_filename(base_name)
-    else:
-        name = f"magnetic_field_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.csv"
+def _create_session_file(name, generic):
     path = os.path.join(DATA_DIR, name)
     with open(path, "w", newline="") as f:
         # This header row just labels the four columns (so Excel/pandas/etc.
@@ -124,45 +123,69 @@ def _new_session_file(base_name=None):
         # Column2..."). It's not measurement data - keep it, don't strip it.
         csv.writer(f).writerow(["timestamp_ms", "timestamp_iso", "voltage_V", "B_field_uT", "gain_code"])
     meta = _load_meta()
-    meta[name] = {"saved": False, "created": int(time.time() * 1000)}
+    meta[name] = {"saved": False, "created": int(time.time() * 1000), "generic": generic}
     _save_meta(meta)
     return path
 
 
+def _new_named_session_file(base_name):
+    return _create_session_file(_unique_filename(base_name), generic=False)
+
+
+def _generic_filename(ts_ms):
+    """yyyy_mm_dd_hh_mm_ss.sss - the exact format requested, where the
+    milliseconds come from ts_ms itself (the timestamp of whatever sample
+    triggers this file's creation)."""
+    dt = datetime.datetime.fromtimestamp(ts_ms / 1000)
+    return dt.strftime("%Y_%m_%d_%H_%M_%S") + f".{dt.microsecond // 1000:03d}.csv"
+
+
+def _new_generic_session_file(ts_ms):
+    name = _generic_filename(ts_ms)
+    # Extremely unlikely (would need two generic files started in the same
+    # millisecond), but guard against a collision the same way named files do.
+    if name in _load_meta() or os.path.exists(os.path.join(DATA_DIR, name)):
+        name = _unique_filename(name[:-4])  # strip ".csv", _unique_filename re-adds it (+ a numeric suffix)
+    return _create_session_file(name, generic=True)
+
+
 def on_start(base_name: str = None):
-    global _recording, _current_file
+    """Start always begins a brand-new NAMED recording (shown in green),
+    stopping whatever was active before it (generic or named) - there's no
+    more "resume" case now that something is always recording."""
+    global _recording, _current_file, _current_is_generic
     with _state_lock:
-        if not _recording:
-            if _current_file is None:
-                _current_file = _new_session_file(base_name)
-            # else: resuming an existing (paused) session - base_name is
-            # ignored here on purpose, there's nothing to rename. The
-            # front-end now only prompts for a name when _current_file is
-            # actually None (see setupRecordingControls in app.js), so this
-            # branch simply won't receive a base_name during a resume.
-            _recording = True
+        _current_file = _new_named_session_file(base_name or DEFAULT_BASENAME_FALLBACK)
+        _current_is_generic = False
+        _recording = True
     return _status()
 
 
 def on_stop():
-    global _recording
+    """Ends the current NAMED recording. A no-op if a generic recording is
+    already active (nothing to "stop" into something new). The actual new
+    generic file gets created lazily by record_sensor_samples, named after
+    whichever sample lands first - see the bootstrap check there."""
+    global _recording, _current_file, _current_is_generic
     with _state_lock:
+        if _current_is_generic:
+            return _status()
+        _current_file = None
         _recording = False
     return _status()
 
 
 def on_clear():
-    global _current_file, _recording, _view_start_ts
+    global _current_file, _recording, _current_is_generic, _view_start_ts
     with _state_lock:
-        # Reset all the way back to the "just booted" state: no active file,
-        # not recording. The live chart keeps showing values in real time
-        # regardless (that's handled independently in record_sensor_samples
-        # below) - Clear just means "forget the current session, and don't
-        # start a new one until I actually press Start". The abandoned file
-        # (if any) isn't deleted - it stays on disk under its old name,
-        # subject to the normal 7-day retention unless it was saved.
+        # Abandon whatever's currently active (generic or named) - the next
+        # sample bootstraps a fresh generic recording (see
+        # record_sensor_samples), same as Stop and same as a true boot. The
+        # abandoned file isn't deleted - it stays on disk, subject to the
+        # normal retention/storage-pressure cleanup unless it was saved.
         _current_file = None
         _recording = False
+        _current_is_generic = False
         # Also move the live-view boundary forward to now, so a page refresh
         # (or a fresh /live_history query) won't show anything from before
         # this Clear - this is the ONLY thing that resets the live view.
@@ -174,6 +197,8 @@ def on_save():
     with _state_lock:
         if not _current_file:
             return {"status": "no_active_session"}
+        if _current_is_generic:
+            return {"error": "This is an auto-recorded file - press Start to begin a named recording you can save."}
         name = os.path.basename(_current_file)
         meta = _load_meta()
         if name in meta:
@@ -187,11 +212,13 @@ def _status():
     name = os.path.basename(_current_file) if _current_file else None
     saved = False
     saved_at = None
+    generic = False
     if name:
         info = _load_meta().get(name, {})
         saved = info.get("saved", False)
         saved_at = info.get("saved_at")
-    return {"recording": _recording, "file": name, "saved": saved, "saved_at": saved_at}
+        generic = info.get("generic", False)
+    return {"recording": _recording, "file": name, "saved": saved, "saved_at": saved_at, "generic": generic}
 
 
 def on_status():
@@ -222,6 +249,7 @@ def on_list_sessions():
     current_name = os.path.basename(_current_file) if _current_file else None
     return sorted(
         [{"file": name, "created": info.get("created"), "saved": info.get("saved", False),
+          "generic": info.get("generic", False),
           "active": name == current_name} for name, info in meta.items()],
         key=lambda s: s["created"] or 0, reverse=True
     )
@@ -322,12 +350,38 @@ def on_download_zip(files: str):
     return {"error": "Zip download requires the fastapi-based web_ui Brick."}
 
 
+def _human_size(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def _disk_usage_html():
+    try:
+        usage = shutil.disk_usage(DATA_DIR)
+        pct = (usage.used / usage.total * 100) if usage.total else 0
+        pct_class = "disk-high" if pct >= STORAGE_HIGH_WATERMARK * 100 else ""
+        return (f'<div class="disk-usage {pct_class}">'
+                f'{_human_size(usage.free)} free of {_human_size(usage.total)} '
+                f'({pct:.0f}% used)</div>')
+    except OSError:
+        return ""
+
+
 def _render_files_page(names, meta, *, title, show_expiry, show_save_button, other_page_link):
     def fmt_ts(ms):
         try:
             return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
             return ""
+
+    def file_size_html(name):
+        try:
+            return f'<span class="fsize">{_human_size(os.path.getsize(os.path.join(DATA_DIR, name)))}</span>'
+        except OSError:
+            return '<span class="fsize">-</span>'
 
     def expiry_html(name):
         if not show_expiry:
@@ -341,7 +395,7 @@ def _render_files_page(names, meta, *, title, show_expiry, show_save_button, oth
         return f'<span class="expiry">expires in {int(days_left)}d</span>'
 
     def save_btn_html(name):
-        if not show_save_button:
+        if not show_save_button or meta[name].get("generic"):
             return ""
         return f'<button class="save-btn" onclick="saveFile(\'{name}\')">Save</button>'
 
@@ -350,6 +404,7 @@ def _render_files_page(names, meta, *, title, show_expiry, show_save_button, oth
             f'<li>'
             f'<input type="checkbox" class="file-check" value="{name}">'
             f'<a href="/download_csv?file={name}" download="{name}">{name}</a>'
+            f'{file_size_html(name)}'
             f'<span class="ts">{fmt_ts(meta[name].get("created", 0))}</span>'
             f'{expiry_html(name)}'
             f'{save_btn_html(name)}'
@@ -387,6 +442,9 @@ def _render_files_page(names, meta, *, title, show_expiry, show_save_button, oth
   a {{ color: #1864ab; text-decoration: none; font-weight: 600; flex: 1; }}
   a:hover {{ text-decoration: underline; }}
   .ts {{ color: #888; font-size: 0.85rem; white-space: nowrap; }}
+  .fsize {{ color: #666; font-size: 0.8rem; white-space: nowrap; min-width: 56px; text-align: right; }}
+  .disk-usage {{ font-size: 0.85rem; color: #555; margin-bottom: 14px; }}
+  .disk-usage.disk-high {{ color: #c92a2a; font-weight: 600; }}
   .expiry {{ color: #999; font-size: 0.8rem; white-space: nowrap; }}
   .expiry-soon {{ color: #c92a2a; font-weight: 600; }}
   .del-btn {{ border: 1px solid #c92a2a; color: #c92a2a; background: #fff;
@@ -399,6 +457,7 @@ def _render_files_page(names, meta, *, title, show_expiry, show_save_button, oth
 </head>
 <body>
   <h1>{title} ({len(names)})</h1>
+  {_disk_usage_html()}
   <a class="other-link" href="{other_page_link[1]}">{other_page_link[0]}</a>
   <div class="bulk-bar">
     <label><input type="checkbox" id="select-all"> Select all</label>
@@ -477,10 +536,13 @@ def _render_files_page(names, meta, *, title, show_expiry, show_save_button, oth
 def on_mark_saved(file: str):
     """Promotes an arbitrary (not necessarily active) session file to
     "saved", protecting it from the 7-day retention cleanup. Used by the
-    Save button on the /files/unsaved page."""
+    Save button on the /files/unsaved page. Generic auto-recordings are
+    never eligible - by design, those only ever live in the unsaved area."""
     meta = _load_meta()
     if file not in meta:
         return {"error": f"Unknown file: {file}"}
+    if meta[file].get("generic"):
+        return {"error": "Generic auto-recordings can't be saved - only named (Start) recordings can."}
     meta[file]["saved"] = True
     meta[file]["saved_at"] = int(time.time() * 1000)
     _save_meta(meta)
@@ -545,6 +607,57 @@ def cleanup_old_sessions():
 
 
 threading.Thread(target=cleanup_old_sessions, daemon=True).start()
+
+# --- Storage-pressure cleanup: if disk usage crosses 90%, delete unsaved
+# files oldest-first (regardless of the 7-day age rule above - under normal
+# operation unsaved files won't be older than 7 days anyway thanks to that
+# rule, but this is a safety net against filling the disk faster than that,
+# e.g. a long fast-sampled session). Runs much more often than the age-based
+# cleanup since running out of disk is more urgent than tidiness. ---
+STORAGE_HIGH_WATERMARK = 0.90  # start deleting once usage crosses this
+STORAGE_LOW_WATERMARK = 0.85   # keep deleting oldest-first until back under this
+
+
+def storage_pressure_cleanup():
+    while True:
+        try:
+            usage = shutil.disk_usage(DATA_DIR)
+            frac_used = (usage.used / usage.total) if usage.total else 0
+            if frac_used >= STORAGE_HIGH_WATERMARK:
+                with _state_lock:
+                    active_name = os.path.basename(_current_file) if _current_file else None
+                meta = _load_meta()
+                oldest_first = sorted(
+                    [(name, info) for name, info in meta.items()
+                     if not info.get("saved") and name != active_name],
+                    key=lambda kv: kv[1].get("created", 0)
+                )
+                for name, _info in oldest_first:
+                    path = os.path.join(DATA_DIR, name)
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except OSError as e:
+                        print(f"[storage-cleanup] could not remove {name}: {e}")
+                        continue
+                    meta = _load_meta()
+                    if name in meta:
+                        del meta[name]
+                        _save_meta(meta)
+                    print(f"[storage-cleanup] removed {name} (disk was at {frac_used * 100:.1f}%)")
+                    usage = shutil.disk_usage(DATA_DIR)
+                    frac_used = (usage.used / usage.total) if usage.total else 0
+                    if frac_used < STORAGE_LOW_WATERMARK:
+                        break
+                # If we ran out of unsaved files and are still over the
+                # watermark, there's nothing more this can safely do -
+                # saved files are never touched.
+        except Exception as e:
+            print(f"[storage-cleanup] error: {e}")
+        time.sleep(30)
+
+
+threading.Thread(target=storage_pressure_cleanup, daemon=True).start()
 
 ui.expose_api("GET", "/get_samples/{resource}/{start}/{aggr_window}",
               lambda resource, start, aggr_window, limit=100:
@@ -762,6 +875,22 @@ def record_sensor_samples(voltage: float):
     # convert voltage to B strength TODO: adjust to voltage distributor:  currently set at 1/3
     B = 3 * V / 0.1  # microT
 
+    global _current_file, _recording, _current_is_generic
+    with _state_lock:
+        if _current_file is None:
+            # No active session - either this is truly the first sample
+            # since boot, or Stop/Clear just deliberately abandoned the
+            # previous file. Either way, auto-start a new generic
+            # recording, named after THIS sample's own timestamp (i.e.
+            # "the moment of the first measurement" - literally true for
+            # the very first file, and true for "the first measurement of
+            # this new file" every time afterward).
+            _current_file = _new_generic_session_file(ts)
+            _current_is_generic = True
+            _recording = True
+        recording = _recording
+        file_path = _current_file
+
     # The live webpage always shows the current value in real time, whether
     # or not it's being recorded.
     ui.send_message('voltage', {"value": V, "ts": ts})
@@ -781,12 +910,8 @@ def record_sensor_samples(voltage: float):
     db.write_sample("voltage", V, ts)
     db.write_sample("B_field", B, ts)
 
-    with _state_lock:
-        recording = _recording
-        file_path = _current_file
-
     if not recording:
-        return  # Stop was pressed (or Start never was, or Clear just reset us) - nothing gets written to CSV/cloud
+        return  # shouldn't really happen anymore given the bootstrap above, kept as a safety net
 
     # --- Persist to CSV + Arduino Cloud, only while recording ---
     if file_path:
