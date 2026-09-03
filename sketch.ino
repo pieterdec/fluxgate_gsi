@@ -14,7 +14,7 @@ volatile unsigned long sample_interval_ms = 1000;
 // Called from Python via Bridge.call("set_sample_interval", ms)
 bool set_sample_interval(int ms)
 {
-    if (ms < 50) ms = 50;              // safety floor: don't hammer the ADC/bridge
+    // if (ms < 50) ms = 50;              // safety floor: don't hammer the ADC/bridge
     if (ms > 3600000) ms = 3600000;    // safety ceiling: at most once per hour
     sample_interval_ms = (unsigned long)ms;
     return true;
