@@ -44,6 +44,39 @@ SPDX-License-Identifier: MPL-2.0
             margin: 0 auto;
         }
 
+        .header {
+            flex-wrap: wrap;
+            row-gap: 6px;
+        }
+
+        .credit-text {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            text-align: center;
+            flex: 1;
+            font-family: "Open Sans", serif;
+            font-size: 11px;
+            line-height: 1.5;
+            color: #7a8585;
+            margin: 0 16px;
+        }
+
+        .credit-text a {
+            color: #008184;
+            text-decoration: none;
+        }
+
+        .credit-text a:hover {
+            text-decoration: underline;
+        }
+
+        @media (max-width: 768px) {
+            .credit-text {
+                display: none;
+            }
+        }
+
         .container,
         .top-row .container {
             width: 100% !important;
@@ -496,6 +529,11 @@ SPDX-License-Identifier: MPL-2.0
 <div class="app-container">
     <div class="header">
         <h1 class="arduino-text">Magnetic field measurement</h1>
+        <div class="credit-text">
+            <span>Made by Pieter Deceuninck as part of the GSI ISSP.</span>
+            <span>Adjusted from Arduino Home Climat monitoring.</span>
+            <span>GitHub: <a href="https://github.com/pieterdec/fluxgate_gsi" target="_blank" rel="noopener">pieterdec/fluxgate_gsi</a></span>
+        </div>
         <img class="gsi-logo" src="./img/favicon.png" alt="GSI Logo">
     </div>
     <div class="live-badge">
